@@ -1,0 +1,50 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "issue-search",
+  "title": "Issue Search",
+  "description": "gh コマンドのログインを使って GitHub の issue を検索し、選んだものをブラウザで開く。",
+  "icon": "icon.png",
+  "author": "nkenji09",
+  "license": "MIT",
+  "categories": [
+    "Developer Tools"
+  ],
+  "commands": [
+    {
+      "name": "search-issues",
+      "title": "Issue を検索",
+      "description": "設定したリポジトリの issue を検索して、ブラウザで開く。",
+      "mode": "view"
+    }
+  ],
+  "preferences": [
+    {
+      "name": "repos",
+      "title": "リポジトリ",
+      "description": "検索するリポジトリを owner/repo の形で、カンマか空白で区切って並べる。",
+      "type": "textfield",
+      "required": true,
+      "placeholder": "owner/repo, owner/another-repo"
+    },
+    {
+      "name": "ghPath",
+      "title": "gh コマンドの場所",
+      "description": "空なら Homebrew の標準の場所から探す。",
+      "type": "textfield",
+      "required": false,
+      "placeholder": "/opt/homebrew/bin/gh"
+    }
+  ],
+  "scripts": {
+    "build": "ray build",
+    "dev": "ray develop"
+  },
+  "dependencies": {
+    "@raycast/api": "^2.12.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "typescript": "^7.0.2"
+  }
+}
