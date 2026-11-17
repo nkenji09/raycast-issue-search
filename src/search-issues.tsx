@@ -370,7 +370,8 @@ export default function Command() {
     />
   );
 
-  // 0 件のときに最初の操作を絞り込みにすると、絞り込みが外れたように見えるので、GitHub での検索を最初に置く
+  // 0 件のときに最初の操作を絞り込みにすると、絞り込みが外れたように見えるので、GitHub での検索を最初に置く。
+  // 開く先は issue の一覧ページにする。github.com/search は "(repo:A OR repo:B)" の書き方を受け付けず 0 件になるため
   const emptyView = (() => {
     if (repos.length === 0) {
       return {
@@ -400,7 +401,7 @@ export default function Command() {
         <ActionPanel>
           <Action.OpenInBrowser
             title="GitHub で同じ条件を検索する"
-            url={`https://github.com/search?type=issues&q=${encodeURIComponent(webQuery)}`}
+            url={`https://github.com/issues?q=${encodeURIComponent(webQuery)}`}
           />
           {filterActions}
         </ActionPanel>
