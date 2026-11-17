@@ -28,6 +28,18 @@ Raycast に「Issue を検索」が現れたら、`npm run dev` は Ctrl+C で�
 初めて開くと設定画面が出るので、「リポジトリ」に検索したいリポジトリを `owner/repo` の形でカンマ区切りで入れてください。
 `gh` が Homebrew の標準の場所（`/opt/homebrew/bin` か `/usr/local/bin`）に無い場合は、「gh コマンドの場所」も入れてください。
 
+## 更新のしかた
+
+Raycast のストアから入れたものではないので、自動では更新されません。新しいバージョンにするときは、clone したフォルダで次を実行してください。
+
+```sh
+git pull
+npm install
+npm run dev
+```
+
+`npm run dev` は、Raycast に「Issue を検索」の新しいバージョンが登録されたら Ctrl+C で止めて構いません。
+
 ## 使い方
 
 | 操作 | キー |
