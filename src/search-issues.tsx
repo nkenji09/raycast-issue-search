@@ -30,19 +30,34 @@ type Issue = {
   assignees: { nodes: { login: string; avatarUrl: string }[] };
 };
 
-const SEARCH_QUERY = `query($q: String!) {
-  search(query: $q, type: ISSUE_ADVANCED, first: 50) {
+type SearchResult = {
+  search: {
+    issueCount: number;
+    pageInfo: { hasNextPage: boolean; endCursor: string | null };
+    nodes: Partial<Issue>[];
+  } | null;
+};
+
+const ISSUE_FIELDS = `id number title url state updatedAt
+  repository { nameWithOwner }
+  issueType { name }
+  assignees(first: 3) { nodes { login avatarUrl } }`;
+
+const SEARCH_QUERY = `query($q: String!, $first: Int!, $after: String) {
+  search(query: $q, type: ISSUE_ADVANCED, first: $first, after: $after) {
     issueCount
-    nodes {
-      ... on Issue {
-        id number title url state updatedAt
-        repository { nameWithOwner }
-        issueType { name }
-        assignees(first: 3) { nodes { login avatarUrl } }
-      }
-    }
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on Issue { ${ISSUE_FIELDS} } }
   }
 }`;
+
+/**
+ * GitHub の検索は単語単位で、単語の途中（"pari" で "parity"）では当たらない。
+ * 部分一致させるため、最近の issue をこの件数まで取っておき、タイトルを手元で絞り込む。
+ */
+const RECENT_PAGES = 3;
+const PAGE_SIZE = 100;
+const TEXT_SEARCH_SIZE = 30;
 
 const STATE_LABEL: Record<IssueState, string> = { open: "Open", closed: "Closed", all: "Open と Closed" };
 
@@ -85,11 +100,15 @@ function resolveGh(ghPath?: string): string {
 /** gh のログインで GraphQL を呼ぶ。一部だけ失敗した応答は、取れた分と失敗の文を両方返す。 */
 function ghGraphql<T>(
   query: string,
-  variables: Record<string, string> = {},
+  variables: Record<string, string | number | undefined> = {},
   signal?: AbortSignal,
 ): Promise<{ data: T; warning?: string }> {
   const args = ["api", "graphql", "-f", `query=${query}`];
-  for (const [name, value] of Object.entries(variables)) args.push("-f", `${name}=${value}`);
+  for (const [name, value] of Object.entries(variables)) {
+    if (value === undefined) continue;
+    // -F は数値を数値として渡す。文字列は -f で、型を推測させない
+    args.push(typeof value === "number" ? "-F" : "-f", `${name}=${value}`);
+  }
   const { ghPath } = getPreferenceValues<Prefs>();
 
   return new Promise((resolve, reject) => {
@@ -107,6 +126,62 @@ function ghGraphql<T>(
       reject(new Error(stderr.trim() || error?.message || "gh の応答を読めませんでした"));
     });
   });
+}
+
+function onlyIssues(nodes: Partial<Issue>[]): Issue[] {
+  return nodes.filter((node): node is Issue => Boolean(node.url));
+}
+
+async function searchIssues(q: string, pages: number, first: number, signal: AbortSignal) {
+  const issues: Issue[] = [];
+  let total = 0;
+  let after: string | undefined;
+  for (let page = 0; page < pages; page++) {
+    const { data, warning } = await ghGraphql<SearchResult>(SEARCH_QUERY, { q, first, after }, signal);
+    if (!data.search) throw new Error(warning || "検索に失敗しました");
+    total = data.search.issueCount;
+    issues.push(...onlyIssues(data.search.nodes));
+    if (!data.search.pageInfo.hasNextPage || !data.search.pageInfo.endCursor) break;
+    after = data.search.pageInfo.endCursor;
+  }
+  return { issues, total };
+}
+
+/** 各リポジトリから、その番号の issue を取る。PR の番号や存在しない番号は結果に出さない。 */
+async function fetchByNumber(repos: string[], number: number, signal: AbortSignal): Promise<Issue[]> {
+  const fields = repos.map((repo, i) => {
+    const [owner, name] = repo.split("/");
+    return `r${i}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { issue(number: ${number}) { ${ISSUE_FIELDS} } }`;
+  });
+  type Result = Record<string, { issue: Issue | null } | null>;
+  const { data } = await ghGraphql<Result>(`{ ${fields.join("\n")} }`, {}, signal);
+  return Object.values(data).flatMap((r) => (r?.issue ? [r.issue] : []));
+}
+
+/** 非同期の取得を、入力が変わるたびに前のものを中止してやり直す。取得中は前の結果を出したままにする。 */
+function useFetch<T>(run: ((signal: AbortSignal) => Promise<T>) | null, key: string): { data?: T; isLoading: boolean } {
+  const [state, setState] = useState<{ data?: T; isLoading: boolean }>({ isLoading: Boolean(run) });
+
+  useEffect(() => {
+    if (!run) {
+      setState({ isLoading: false });
+      return;
+    }
+    const controller = new AbortController();
+    setState((prev) => ({ data: prev.data, isLoading: true }));
+    run(controller.signal)
+      .then((data) => {
+        if (!controller.signal.aborted) setState({ data, isLoading: false });
+      })
+      .catch((error: Error) => {
+        if (controller.signal.aborted) return;
+        setState({ isLoading: false });
+        showToast({ style: Toast.Style.Failure, title: "検索に失敗しました", message: error.message });
+      });
+    return () => controller.abort();
+  }, [key]);
+
+  return state;
 }
 
 /** 設定したリポジトリで使える Issue Type の名前。見つからないリポジトリがあれば知らせる。 */
@@ -142,6 +217,11 @@ function useIssueTypes(repos: string[]): string[] {
   return types;
 }
 
+/** 全角と半角、大文字と小文字の違いを無視して比べるための形にする。 */
+function normalize(s: string): string {
+  return s.normalize("NFKC").toLowerCase();
+}
+
 export default function Command() {
   const repos = useMemo(() => parseRepos(getPreferenceValues<Prefs>().repos), []);
   const [text, setText] = useState("");
@@ -155,45 +235,53 @@ export default function Command() {
   const typeOptions = issueType && !types.includes(issueType) ? [issueType, ...types] : types;
 
   const activeRepos = repos.filter((repo) => !excluded.includes(repo));
-  const query = useMemo(() => {
+  const trimmed = text.trim();
+  // "#123" は番号だけで探す。打ちかけの "#" も番号の入力中として扱い、キーワード検索に回さない
+  const numberMode = /^#\d*$/.test(trimmed);
+  const issueNumber = numberMode && trimmed.length > 1 ? Number(trimmed.slice(1)) : null;
+  // "label:bug" のような GitHub の検索条件はタイトルの文字では判定できないので、GitHub の検索だけに任せる
+  const hasQualifier = /\S:\S/.test(trimmed);
+
+  const baseQuery = useMemo(() => {
     if (activeRepos.length === 0) return null;
     const parts = [`(${activeRepos.map((repo) => `repo:${repo}`).join(" OR ")})`, "is:issue"];
     if (state !== "all") parts.push(`is:${state}`);
     if (issueType) parts.push(`type:"${issueType.replace(/"/g, "")}"`);
     if (mine) parts.push("assignee:@me");
-    if (text.trim()) parts.push(text.trim());
-    parts.push("sort:updated-desc");
     return parts.join(" ");
-  }, [activeRepos.join(","), state, issueType, mine, text]);
+  }, [activeRepos.join(","), state, issueType, mine]);
 
-  const [issues, setIssues] = useState<Issue[]>([]);
-  const [total, setTotal] = useState(0);
-  const [isLoading, setIsLoading] = useState(true);
+  const textQuery = baseQuery && trimmed && !numberMode ? `${baseQuery} ${trimmed}` : null;
 
-  useEffect(() => {
-    if (!query) {
-      setIssues([]);
-      setTotal(0);
-      setIsLoading(false);
-      return;
-    }
-    const controller = new AbortController();
-    setIsLoading(true);
-    type Result = { search: { issueCount: number; nodes: Partial<Issue>[] } | null };
-    ghGraphql<Result>(SEARCH_QUERY, { q: query }, controller.signal)
-      .then(({ data, warning }) => {
-        if (!data.search) throw new Error(warning || "検索に失敗しました");
-        setIssues(data.search.nodes.filter((node): node is Issue => Boolean(node.url)));
-        setTotal(data.search.issueCount);
-        setIsLoading(false);
-      })
-      .catch((error: Error) => {
-        if (controller.signal.aborted) return;
-        setIsLoading(false);
-        showToast({ style: Toast.Style.Failure, title: "検索に失敗しました", message: error.message });
-      });
-    return () => controller.abort();
-  }, [query]);
+  const recent = useFetch(
+    baseQuery ? (signal) => searchIssues(`${baseQuery} sort:updated-desc`, RECENT_PAGES, PAGE_SIZE, signal) : null,
+    baseQuery ?? "",
+  );
+  // 本文やコメントにだけ含まれる語も探すため、GitHub の検索も関連の強い順で並べる
+  const textSearch = useFetch(
+    textQuery ? (signal) => searchIssues(textQuery, 1, TEXT_SEARCH_SIZE, signal) : null,
+    textQuery ?? "",
+  );
+  const byNumber = useFetch(
+    issueNumber !== null && activeRepos.length > 0
+      ? (signal) => fetchByNumber(activeRepos, issueNumber, signal)
+      : null,
+    issueNumber !== null ? `${activeRepos.join(",")}#${issueNumber}` : "",
+  );
+
+  const terms = normalize(trimmed).split(/\s+/).filter(Boolean);
+  const titleMatches =
+    numberMode || hasQualifier
+      ? []
+      : (recent.data?.issues ?? []).filter((issue) => {
+          const title = normalize(issue.title);
+          return terms.every((term) => title.includes(term));
+        });
+  const titleIds = new Set(titleMatches.map((issue) => issue.id));
+  const textMatches = textQuery ? (textSearch.data?.issues ?? []).filter((issue) => !titleIds.has(issue.id)) : [];
+  const numberMatches = issueNumber !== null ? (byNumber.data ?? []) : [];
+
+  const isLoading = numberMode ? byNumber.isLoading : recent.isLoading || textSearch.isLoading;
 
   const toggleRepo = (repo: string) =>
     setExcluded(excluded.includes(repo) ? excluded.filter((r) => r !== repo) : [...excluded, repo]);
@@ -239,19 +327,92 @@ export default function Command() {
     </ActionPanel.Section>
   );
 
-  const summary = [
-    total > issues.length ? `${total} 件中 ${issues.length} 件` : `${issues.length} 件`,
+  const filterSummary = [
     STATE_LABEL[state],
     mine ? "自分が担当" : "担当者を問わない",
     activeRepos.length === repos.length ? "すべてのリポジトリ" : activeRepos.join(", "),
   ].join(" ・ ");
 
+  const recentCount = recent.data?.issues.length ?? 0;
+  const recentTotal = recent.data?.total ?? 0;
+  const recentScope = recentTotal > recentCount ? `最近更新された ${recentCount} 件` : `${recentCount} 件`;
+  const titleSectionTitle = trimmed
+    ? `タイトルに含む：${titleMatches.length} 件（${recentScope}の中から）`
+    : `${recentTotal > recentCount ? `${recentTotal} 件中 ${recentCount} 件` : `${recentCount} 件`} ・ ${filterSummary}`;
+
+  const renderItem = (issue: Issue) => (
+    <List.Item
+      key={issue.id}
+      icon={
+        issue.state === "OPEN"
+          ? { source: Icon.Circle, tintColor: Color.Green }
+          : { source: Icon.CheckCircle, tintColor: Color.Purple }
+      }
+      title={issue.title}
+      subtitle={`${repos.length > 1 ? issue.repository.nameWithOwner : ""}#${issue.number}`}
+      accessories={[
+        ...(issue.issueType ? [{ tag: issue.issueType.name }] : []),
+        ...issue.assignees.nodes.map((user) => ({
+          icon: { source: user.avatarUrl, mask: Image.Mask.Circle },
+          tooltip: user.login,
+        })),
+        { date: new Date(issue.updatedAt), tooltip: "最後に更新された日時" },
+      ]}
+      actions={
+        <ActionPanel>
+          <ActionPanel.Section>
+            <Action.OpenInBrowser url={issue.url} />
+            <Action.CopyToClipboard title="URL をコピー" content={issue.url} />
+          </ActionPanel.Section>
+          {filterActions}
+        </ActionPanel>
+      }
+    />
+  );
+
+  // 0 件のときに最初の操作を絞り込みにすると、絞り込みが外れたように見えるので、GitHub での検索を最初に置く
+  const emptyView = (() => {
+    if (repos.length === 0) {
+      return {
+        title: "リポジトリが設定されていません",
+        description: "設定に owner/repo の形で入力してください",
+        actions: <ActionPanel>{filterActions}</ActionPanel>,
+      };
+    }
+    if (activeRepos.length === 0) {
+      return {
+        title: "リポジトリが 1 つも選ばれていません",
+        description: "⌘⇧R で検索するリポジトリを選んでください",
+        actions: <ActionPanel>{filterActions}</ActionPanel>,
+      };
+    }
+    if (numberMode && issueNumber === null) {
+      return { title: "issue の番号を入力してください", description: filterSummary, actions: undefined };
+    }
+    const webQuery =
+      issueNumber !== null
+        ? `(${activeRepos.map((repo) => `repo:${repo}`).join(" OR ")}) is:issue ${issueNumber}`
+        : `${baseQuery} ${trimmed}`.trim();
+    return {
+      title: issueNumber !== null ? `#${issueNumber} の issue は見つかりませんでした` : "該当する issue がありません",
+      description: issueNumber !== null ? activeRepos.join(", ") : filterSummary,
+      actions: (
+        <ActionPanel>
+          <Action.OpenInBrowser
+            title="GitHub で同じ条件を検索する"
+            url={`https://github.com/search?type=issues&q=${encodeURIComponent(webQuery)}`}
+          />
+          {filterActions}
+        </ActionPanel>
+      ),
+    };
+  })();
+
   return (
     <List
       isLoading={isLoading}
-      throttle
       onSearchTextChange={setText}
-      searchBarPlaceholder="キーワードで検索（label:bug のような条件も書けます）"
+      searchBarPlaceholder="タイトルの一部・本文の語・#番号（label:bug のような条件も書けます）"
       searchBarAccessory={
         <List.Dropdown tooltip="Issue Type" value={issueType} onChange={setIssueType}>
           <List.Dropdown.Item title="すべての Issue Type" value="" />
@@ -262,49 +423,21 @@ export default function Command() {
       }
       actions={<ActionPanel>{filterActions}</ActionPanel>}
     >
-      <List.EmptyView
-        icon={Icon.MagnifyingGlass}
-        title={
-          repos.length === 0
-            ? "リポジトリが設定されていません"
-            : activeRepos.length === 0
-              ? "リポジトリが 1 つも選ばれていません"
-              : "該当する issue がありません"
-        }
-        description={repos.length === 0 ? "設定に owner/repo の形で入力してください" : summary}
-        actions={<ActionPanel>{filterActions}</ActionPanel>}
-      />
-      <List.Section title={summary}>
-        {issues.map((issue) => (
-          <List.Item
-            key={issue.id}
-            icon={
-              issue.state === "OPEN"
-                ? { source: Icon.Circle, tintColor: Color.Green }
-                : { source: Icon.CheckCircle, tintColor: Color.Purple }
-            }
-            title={issue.title}
-            subtitle={`${repos.length > 1 ? issue.repository.nameWithOwner : ""}#${issue.number}`}
-            accessories={[
-              ...(issue.issueType ? [{ tag: issue.issueType.name }] : []),
-              ...issue.assignees.nodes.map((user) => ({
-                icon: { source: user.avatarUrl, mask: Image.Mask.Circle },
-                tooltip: user.login,
-              })),
-              { date: new Date(issue.updatedAt), tooltip: "最後に更新された日時" },
-            ]}
-            actions={
-              <ActionPanel>
-                <ActionPanel.Section>
-                  <Action.OpenInBrowser url={issue.url} />
-                  <Action.CopyToClipboard title="URL をコピー" content={issue.url} />
-                </ActionPanel.Section>
-                {filterActions}
-              </ActionPanel>
-            }
-          />
-        ))}
-      </List.Section>
+      {!isLoading && <List.EmptyView icon={Icon.MagnifyingGlass} {...emptyView} />}
+      {numberMode ? (
+        <List.Section title={`#${issueNumber ?? ""}（Open / Closed・Issue Type・担当者の絞り込みは使いません）`}>
+          {numberMatches.map(renderItem)}
+        </List.Section>
+      ) : (
+        <>
+          {!hasQualifier && <List.Section title={titleSectionTitle}>{titleMatches.map(renderItem)}</List.Section>}
+          {textQuery && (
+            <List.Section title={`GitHub の検索で一致：本文やコメントも含む（${textMatches.length} 件）`}>
+              {textMatches.map(renderItem)}
+            </List.Section>
+          )}
+        </>
+      )}
     </List>
   );
 }
