@@ -486,6 +486,9 @@ export default function Command() {
   const renderItem = (issue: Issue) => {
     const ancestors = ancestorsOf(issue, parentMap);
     const path = ancestors.map((p) => p.title).join(" › ");
+    // Issue Type が無い親は名前で見分けられないので、何段上の親かで呼ぶ
+    const labelOf = (p: (typeof ancestors)[number], i: number) =>
+      p.issueType?.name ?? `親（${ancestors.length - i}段上）`;
     return (
       <List.Item
         key={issue.id}
@@ -516,10 +519,10 @@ export default function Command() {
             markdown={`### ${issue.title.replace(/[\\`*_[\]#<>]/g, "\\$&")}`}
             metadata={
               <List.Item.Detail.Metadata>
-                {ancestors.map((p) => (
+                {ancestors.map((p, i) => (
                   <List.Item.Detail.Metadata.Link
                     key={p.url}
-                    title={p.issueType?.name ?? "親"}
+                    title={labelOf(p, i)}
                     text={`#${p.number} ${p.title}`}
                     target={p.url}
                   />
@@ -556,7 +559,7 @@ export default function Command() {
                 {ancestors.map((p, i) => (
                   <Action.OpenInBrowser
                     key={p.url}
-                    title={`${p.issueType?.name ?? "親"} を開く：${p.title}`}
+                    title={`${labelOf(p, i)}を開く：${p.title}`}
                     url={p.url}
                     shortcut={{ modifiers: ["cmd", "shift"], key: String(i + 1) as Keyboard.KeyEquivalent }}
                   />
