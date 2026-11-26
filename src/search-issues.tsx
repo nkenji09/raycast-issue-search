@@ -5,6 +5,7 @@ import {
   Color,
   Icon,
   Image,
+  Keyboard,
   List,
   Toast,
   getPreferenceValues,
@@ -18,6 +19,15 @@ import { useEffect, useMemo, useState } from "react";
 type Prefs = { repos: string; ghPath?: string };
 type IssueState = "open" | "closed" | "all";
 
+type ParentIssue = {
+  id: string;
+  number: number;
+  title: string;
+  url: string;
+  issueType: { name: string } | null;
+  parent?: ParentIssue | null;
+};
+
 type Issue = {
   id: string;
   number: number;
@@ -28,6 +38,7 @@ type Issue = {
   repository: { nameWithOwner: string };
   issueType: { name: string } | null;
   assignees: { nodes: { login: string; avatarUrl: string }[] };
+  parent: ParentIssue | null;
 };
 
 type SearchResult = {
@@ -38,10 +49,20 @@ type SearchResult = {
   } | null;
 };
 
+const PARENT_FIELDS = "id number title url issueType { name }";
+
+/**
+ * 親の親より上は、検索とは別に、見つかった親の分だけまとめて取る（useAncestors）。
+ * 検索の 300 件すべてに祖先を入れ子で付けると応答が重くなるが、親になる issue は少ないため。
+ * GraphQL は同じ形を繰り返し辿れないので入れ子で書き並べる。sub-issue は 8 階層までなので、7 段で一番上まで届く。
+ */
+const ANCESTOR_FIELDS = Array.from({ length: 7 }).reduce<string>((inner) => `parent { ${PARENT_FIELDS} ${inner} }`, "");
+
 const ISSUE_FIELDS = `id number title url state updatedAt
   repository { nameWithOwner }
   issueType { name }
-  assignees(first: 3) { nodes { login avatarUrl } }`;
+  assignees(first: 3) { nodes { login avatarUrl } }
+  parent { ${PARENT_FIELDS} }`;
 
 const SEARCH_QUERY = `query($q: String!, $first: Int!, $after: String) {
   search(query: $q, type: ISSUE_ADVANCED, first: $first, after: $after) {
@@ -132,7 +153,16 @@ function onlyIssues(nodes: Partial<Issue>[]): Issue[] {
   return nodes.filter((node): node is Issue => Boolean(node.url));
 }
 
-async function searchIssues(q: string, pages: number, first: number, signal: AbortSignal) {
+type Found = { issues: Issue[]; total: number };
+
+/** onPage には、ページが届くたびにそこまでの結果を渡す。全部そろう前に一覧を出せるようにするため。 */
+async function searchIssues(
+  q: string,
+  pages: number,
+  first: number,
+  signal: AbortSignal,
+  onPage?: (found: Found) => void,
+): Promise<Found> {
   const issues: Issue[] = [];
   let total = 0;
   let after: string | undefined;
@@ -141,6 +171,7 @@ async function searchIssues(q: string, pages: number, first: number, signal: Abo
     if (!data.search) throw new Error(warning || "検索に失敗しました");
     total = data.search.issueCount;
     issues.push(...onlyIssues(data.search.nodes));
+    onPage?.({ issues: [...issues], total });
     if (!data.search.pageInfo.hasNextPage || !data.search.pageInfo.endCursor) break;
     after = data.search.pageInfo.endCursor;
   }
@@ -158,9 +189,30 @@ async function fetchByNumber(repos: string[], number: number, signal: AbortSigna
   return Object.values(data).flatMap((r) => (r?.issue ? [r.issue] : []));
 }
 
-/** 非同期の取得を、入力が変わるたびに前のものを中止してやり直す。取得中は前の結果を出したままにする。 */
-function useFetch<T>(run: ((signal: AbortSignal) => Promise<T>) | null, key: string): { data?: T; isLoading: boolean } {
-  const [state, setState] = useState<{ data?: T; isLoading: boolean }>({ isLoading: Boolean(run) });
+function readCache<T>(key: string): T | undefined {
+  try {
+    const raw = cache.get(key);
+    return raw ? (JSON.parse(raw) as T) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 非同期の取得を、入力が変わるたびに前のものを中止してやり直す。取得中は前の結果を出したままにする。
+ * cacheKey を渡すと、前回の結果を次の起動まで覚え、取得を待たずに先に出す。
+ * delay を渡すと、入力が止まるまで取得を待つ。打つたびに gh を起動しないため。
+ */
+function useFetch<T>(
+  run: ((signal: AbortSignal, update: (partial: T) => void) => Promise<T>) | null,
+  key: string,
+  options: { cacheKey?: string; delay?: number } = {},
+): { data?: T; isLoading: boolean } {
+  const { cacheKey, delay = 0 } = options;
+  const [state, setState] = useState<{ data?: T; isLoading: boolean }>(() => ({
+    data: cacheKey ? readCache<T>(cacheKey) : undefined,
+    isLoading: Boolean(run),
+  }));
 
   useEffect(() => {
     if (!run) {
@@ -168,17 +220,29 @@ function useFetch<T>(run: ((signal: AbortSignal) => Promise<T>) | null, key: str
       return;
     }
     const controller = new AbortController();
-    setState((prev) => ({ data: prev.data, isLoading: true }));
-    run(controller.signal)
-      .then((data) => {
-        if (!controller.signal.aborted) setState({ data, isLoading: false });
-      })
-      .catch((error: Error) => {
-        if (controller.signal.aborted) return;
-        setState({ isLoading: false });
-        showToast({ style: Toast.Style.Failure, title: "検索に失敗しました", message: error.message });
-      });
-    return () => controller.abort();
+    const cached = cacheKey ? readCache<T>(cacheKey) : undefined;
+    setState((prev) => ({ data: cached ?? prev.data, isLoading: true }));
+    // 前回の結果を先に出しているときは、途中の結果で件数が減って見えないよう、全部そろうまで差し替えない
+    const update = (partial: T) => {
+      if (!controller.signal.aborted && cached === undefined) setState({ data: partial, isLoading: true });
+    };
+    const timer = setTimeout(() => {
+      run(controller.signal, update)
+        .then((data) => {
+          if (controller.signal.aborted) return;
+          setState({ data, isLoading: false });
+          if (cacheKey) cache.set(cacheKey, JSON.stringify(data));
+        })
+        .catch((error: Error) => {
+          if (controller.signal.aborted) return;
+          setState((prev) => ({ data: prev.data, isLoading: false }));
+          showToast({ style: Toast.Style.Failure, title: "検索に失敗しました", message: error.message });
+        });
+    }, delay);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
   }, [key]);
 
   return state;
@@ -217,6 +281,70 @@ function useIssueTypes(repos: string[]): string[] {
   return types;
 }
 
+type ParentRecord = Omit<ParentIssue, "parent"> & { parentId: string | null };
+type ParentMap = Record<string, ParentRecord>;
+
+/**
+ * 一覧に出た親について、その上の祖先を一番上まで取り、id ごとの表にする。
+ * 表は次の起動まで覚えて先に使い、起動のたびに 1 度だけ取り直して最新にする。
+ */
+function useAncestors(issues: Issue[]): ParentMap {
+  const [map, setMap] = useStored<ParentMap>("parents", {});
+  const [fetched] = useState(() => new Set<string>());
+  const parentIds = [...new Set(issues.flatMap((issue) => (issue.parent ? [issue.parent.id] : [])))]
+    .filter((id) => !fetched.has(id))
+    .sort();
+  const key = parentIds.join(",");
+
+  useEffect(() => {
+    if (parentIds.length === 0) return;
+    parentIds.forEach((id) => fetched.add(id));
+    type Result = { nodes: (Partial<ParentIssue> | null)[] };
+    // nodes(ids:) は 1 回に 100 件まで
+    const chunks = Array.from({ length: Math.ceil(parentIds.length / 100) }, (_, i) =>
+      parentIds.slice(i * 100, i * 100 + 100),
+    );
+    Promise.all(
+      chunks.map((ids) =>
+        // id は GitHub が返した値なので、JSON の文字列としてクエリに埋め込む
+        ghGraphql<Result>(
+          `{ nodes(ids: ${JSON.stringify(ids)}) { ... on Issue { ${PARENT_FIELDS} ${ANCESTOR_FIELDS} } } }`,
+        ),
+      ),
+    )
+      .then((results) => {
+        const next: ParentMap = { ...readCache<ParentMap>("parents") };
+        const add = (p: ParentIssue) => {
+          const { parent, ...rest } = p;
+          next[p.id] = { ...rest, parentId: parent?.id ?? null };
+          if (parent) add(parent);
+        };
+        results.forEach(({ data }) => data.nodes.forEach((node) => node?.id && add(node as ParentIssue)));
+        setMap(next);
+      })
+      .catch(() => {
+        // 祖先が取れなくても、直接の親は検索の結果にあるので、それだけ出す
+        parentIds.forEach((id) => fetched.delete(id));
+      });
+  }, [key]);
+
+  return map;
+}
+
+/** 親を上（Epic 側）から順に並べる。表に無い祖先は、わかっている所までにする。 */
+function ancestorsOf(issue: Issue, map: ParentMap): Omit<ParentIssue, "parent">[] {
+  const chain: Omit<ParentIssue, "parent">[] = [];
+  const seen = new Set<string>();
+  let current: Omit<ParentIssue, "parent"> | undefined = issue.parent ?? undefined;
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id);
+    chain.unshift(current);
+    const parentId: string | null | undefined = map[current.id]?.parentId;
+    current = parentId ? map[parentId] : undefined;
+  }
+  return chain;
+}
+
 /** 全角と半角、大文字と小文字の違いを無視して比べるための形にする。 */
 function normalize(s: string): string {
   return s.normalize("NFKC").toLowerCase();
@@ -229,6 +357,7 @@ export default function Command() {
   const [issueType, setIssueType] = useStored<string>("issueType", "");
   const [state, setState] = useStored<IssueState>("state", "open");
   const [mine, setMine] = useStored<boolean>("mine", false);
+  const [showDetail, setShowDetail] = useStored<boolean>("detailPanel", false);
 
   const types = useIssueTypes(repos);
   // 覚えていた Issue Type が一覧に無いと Dropdown が先頭に戻して記憶を消すので、必ず選択肢に含める
@@ -253,14 +382,18 @@ export default function Command() {
 
   const textQuery = baseQuery && trimmed && !numberMode ? `${baseQuery} ${trimmed}` : null;
 
-  const recent = useFetch(
-    baseQuery ? (signal) => searchIssues(`${baseQuery} sort:updated-desc`, RECENT_PAGES, PAGE_SIZE, signal) : null,
+  const recent = useFetch<Found>(
+    baseQuery
+      ? (signal, update) => searchIssues(`${baseQuery} sort:updated-desc`, RECENT_PAGES, PAGE_SIZE, signal, update)
+      : null,
     baseQuery ?? "",
+    { cacheKey: `recent:${baseQuery}` },
   );
   // 本文やコメントにだけ含まれる語も探すため、GitHub の検索も関連の強い順で並べる
   const textSearch = useFetch(
     textQuery ? (signal) => searchIssues(textQuery, 1, TEXT_SEARCH_SIZE, signal) : null,
     textQuery ?? "",
+    { delay: 300 },
   );
   const byNumber = useFetch(
     issueNumber !== null && activeRepos.length > 0
@@ -269,17 +402,21 @@ export default function Command() {
     issueNumber !== null ? `${activeRepos.join(",")}#${issueNumber}` : "",
   );
 
+  // 打つたびに 300 件のタイトルを正規化し直さないよう、取得した時点で 1 度だけ作る
+  const normalizedRecent = useMemo(
+    () => (recent.data?.issues ?? []).map((issue) => ({ issue, title: normalize(issue.title) })),
+    [recent.data],
+  );
   const terms = normalize(trimmed).split(/\s+/).filter(Boolean);
   const titleMatches =
     numberMode || hasQualifier
       ? []
-      : (recent.data?.issues ?? []).filter((issue) => {
-          const title = normalize(issue.title);
-          return terms.every((term) => title.includes(term));
-        });
+      : normalizedRecent.filter(({ title }) => terms.every((term) => title.includes(term))).map(({ issue }) => issue);
   const titleIds = new Set(titleMatches.map((issue) => issue.id));
   const textMatches = textQuery ? (textSearch.data?.issues ?? []).filter((issue) => !titleIds.has(issue.id)) : [];
   const numberMatches = issueNumber !== null ? (byNumber.data ?? []) : [];
+
+  const parentMap = useAncestors([...titleMatches, ...textMatches, ...numberMatches]);
 
   const isLoading = numberMode ? byNumber.isLoading : recent.isLoading || textSearch.isLoading;
 
@@ -323,6 +460,12 @@ export default function Command() {
         shortcut={{ modifiers: ["cmd", "shift"], key: "m" }}
         onAction={() => setMine(!mine)}
       />
+      <Action
+        title={showDetail ? "詳細パネルを隠す" : "詳細パネルを出す"}
+        icon={Icon.Sidebar}
+        shortcut={{ modifiers: ["cmd", "shift"], key: "d" }}
+        onAction={() => setShowDetail(!showDetail)}
+      />
       <Action title="リポジトリの設定を開く" icon={Icon.Gear} onAction={openExtensionPreferences} />
     </ActionPanel.Section>
   );
@@ -340,35 +483,92 @@ export default function Command() {
     ? `タイトルに含む：${titleMatches.length} 件（${recentScope}の中から）`
     : `${recentTotal > recentCount ? `${recentTotal} 件中 ${recentCount} 件` : `${recentCount} 件`} ・ ${filterSummary}`;
 
-  const renderItem = (issue: Issue) => (
-    <List.Item
-      key={issue.id}
-      icon={
-        issue.state === "OPEN"
-          ? { source: Icon.Circle, tintColor: Color.Green }
-          : { source: Icon.CheckCircle, tintColor: Color.Purple }
-      }
-      title={issue.title}
-      subtitle={`${repos.length > 1 ? issue.repository.nameWithOwner : ""}#${issue.number}`}
-      accessories={[
-        ...(issue.issueType ? [{ tag: issue.issueType.name }] : []),
-        ...issue.assignees.nodes.map((user) => ({
-          icon: { source: user.avatarUrl, mask: Image.Mask.Circle },
-          tooltip: user.login,
-        })),
-        { date: new Date(issue.updatedAt), tooltip: "最後に更新された日時" },
-      ]}
-      actions={
-        <ActionPanel>
-          <ActionPanel.Section>
-            <Action.OpenInBrowser url={issue.url} />
-            <Action.CopyToClipboard title="URL をコピー" content={issue.url} />
-          </ActionPanel.Section>
-          {filterActions}
-        </ActionPanel>
-      }
-    />
-  );
+  const renderItem = (issue: Issue) => {
+    const ancestors = ancestorsOf(issue, parentMap);
+    const path = ancestors.map((p) => p.title).join(" › ");
+    return (
+      <List.Item
+        key={issue.id}
+        icon={
+          issue.state === "OPEN"
+            ? { source: Icon.Circle, tintColor: Color.Green }
+            : { source: Icon.CheckCircle, tintColor: Color.Purple }
+        }
+        // 行の文字は折り返せず、長いタイトルは切れるので、マウスを載せると全文が出るようにする
+        title={{ value: issue.title, tooltip: issue.title }}
+        // 詳細パネルを出している間はタイトルの幅が狭いので、親の道筋はパネルに任せて行からは外す
+        subtitle={{
+          value: `${repos.length > 1 ? issue.repository.nameWithOwner : ""}#${issue.number}${path && !showDetail ? `  ${path}` : ""}`,
+          tooltip: path || null,
+        }}
+        accessories={[
+          ...(issue.issueType ? [{ tag: issue.issueType.name }] : []),
+          ...issue.assignees.nodes.map((user) => ({
+            icon: { source: user.avatarUrl, mask: Image.Mask.Circle },
+            tooltip: user.login,
+          })),
+          { date: new Date(issue.updatedAt), tooltip: "最後に更新された日時" },
+        ]}
+        detail={
+          // 一覧の行の文字はクリックできないので、親へのリンクはこのパネルに置く
+          <List.Item.Detail
+            // 一覧では切れるタイトルを、パネルでは折り返して全文を読めるようにする
+            markdown={`### ${issue.title.replace(/[\\`*_[\]#<>]/g, "\\$&")}`}
+            metadata={
+              <List.Item.Detail.Metadata>
+                {ancestors.map((p) => (
+                  <List.Item.Detail.Metadata.Link
+                    key={p.url}
+                    title={p.issueType?.name ?? "親"}
+                    text={`#${p.number} ${p.title}`}
+                    target={p.url}
+                  />
+                ))}
+                <List.Item.Detail.Metadata.Link
+                  title={`${issue.issueType?.name ?? "この issue"}（これ）`}
+                  text={`#${issue.number} ${issue.title}`}
+                  target={issue.url}
+                />
+                <List.Item.Detail.Metadata.Separator />
+                <List.Item.Detail.Metadata.Label title="状態" text={issue.state === "OPEN" ? "Open" : "Closed"} />
+                <List.Item.Detail.Metadata.Label
+                  title="担当者"
+                  text={issue.assignees.nodes.map((user) => user.login).join(", ") || "なし"}
+                />
+                <List.Item.Detail.Metadata.Label title="リポジトリ" text={issue.repository.nameWithOwner} />
+                <List.Item.Detail.Metadata.Label
+                  title="最後に更新された日時"
+                  text={new Date(issue.updatedAt).toLocaleString("ja-JP")}
+                />
+              </List.Item.Detail.Metadata>
+            }
+          />
+        }
+        actions={
+          <ActionPanel>
+            <ActionPanel.Section>
+              <Action.OpenInBrowser url={issue.url} />
+              <Action.CopyToClipboard title="URL をコピー" content={issue.url} />
+            </ActionPanel.Section>
+            {ancestors.length > 0 && (
+              // キーボードだけでも親を開けるようにする。番号は subtitle の並び順（一番上の親が 1）
+              <ActionPanel.Section title="親の issue">
+                {ancestors.map((p, i) => (
+                  <Action.OpenInBrowser
+                    key={p.url}
+                    title={`${p.issueType?.name ?? "親"} を開く：${p.title}`}
+                    url={p.url}
+                    shortcut={{ modifiers: ["cmd", "shift"], key: String(i + 1) as Keyboard.KeyEquivalent }}
+                  />
+                ))}
+              </ActionPanel.Section>
+            )}
+            {filterActions}
+          </ActionPanel>
+        }
+      />
+    );
+  };
 
   // 0 件のときに最初の操作を絞り込みにすると、絞り込みが外れたように見えるので、GitHub での検索を最初に置く。
   // 開く先は issue の一覧ページにする。github.com/search は "(repo:A OR repo:B)" の書き方を受け付けず 0 件になるため
@@ -412,7 +612,13 @@ export default function Command() {
   return (
     <List
       isLoading={isLoading}
-      onSearchTextChange={setText}
+      isShowingDetail={showDetail}
+      searchText={text}
+      // 数字だけを打ったら番号で探したいときなので、"#" を補って番号の検索にする
+      // 補った "#" を自分で消したときは、消したまま（キーワードの検索）にする
+      onSearchTextChange={(value) =>
+        setText((prev) => (/^[0-9]+$/.test(value) && prev !== `#${value}` ? `#${value}` : value))
+      }
       searchBarPlaceholder="タイトルの一部・本文の語・#番号（label:bug のような条件も書けます）"
       searchBarAccessory={
         <List.Dropdown tooltip="Issue Type" value={issueType} onChange={setIssueType}>
