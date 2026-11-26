@@ -3,21 +3,45 @@ import {
   ActionPanel,
   Cache,
   Color,
+  Form,
   Icon,
   Image,
   Keyboard,
   List,
+  LocalStorage,
   Toast,
   getPreferenceValues,
   openExtensionPreferences,
   showToast,
+  useNavigation,
 } from "@raycast/api";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { useEffect, useMemo, useState } from "react";
 
-type Prefs = { repos: string; ghPath?: string };
+type Prefs = { repos?: string; ghPath?: string };
 type IssueState = "open" | "closed" | "all";
+
+/**
+ * Iteration の絞り込み。"" は絞り込まない。それ以外の "@" で始まるものは相対の指定で、
+ * スプリントが替わっても選び直さずに済むよう、名前ではなくこの形で覚える。ほかは Iteration の名前。
+ */
+type IterationChoice = string;
+const RELATIVE_ITERATIONS = ["@current", "@next", "@previous"] as const;
+const NO_ITERATION = "@none";
+
+type Iteration = { title: string; startDate: string; duration: number };
+type ProjectInfo = {
+  id: string;
+  url: string;
+  title: string;
+  /** Iteration のフィールドが無いプロジェクトでは null */
+  iterationField: {
+    name: string;
+    iterations: Iteration[];
+    completedIterations: Iteration[];
+  } | null;
+};
 
 type ParentIssue = {
   id: string;
@@ -80,7 +104,14 @@ const RECENT_PAGES = 3;
 const PAGE_SIZE = 100;
 const TEXT_SEARCH_SIZE = 30;
 
-const STATE_LABEL: Record<IssueState, string> = { open: "Open", closed: "Closed", all: "Open と Closed" };
+/** 右上の選択の値で、リポジトリとプロジェクトの id をつなぐ記号。どちらにも現れない文字にする。 */
+const SCOPE_SEPARATOR = " ";
+
+const STATE_LABEL: Record<IssueState, string> = {
+  open: "Open",
+  closed: "Closed",
+  all: "Open と Closed",
+};
 
 const cache = new Cache();
 
@@ -103,13 +134,95 @@ function useStored<T>(key: string, initial: T): [T, (value: T) => void] {
   ];
 }
 
-/** 設定の文字列から owner/repo を取り出す。検索クエリに埋め込むので、形が合わないものは捨てる。 */
+/** 1 つ分の書き方を owner/repo にそろえる。形が合わなければ null。 */
+function parseRepo(raw: string): string | null {
+  const s = raw
+    .trim()
+    .replace(/^https?:\/\/github\.com\//, "")
+    .replace(/(\.git)?\/?$/, "");
+  return /^[\w.-]+\/[\w.-]+$/.test(s) ? s : null;
+}
+
+/** 登録の文字列から owner/repo を取り出す。検索クエリに埋め込むので、形が合わないものは捨てる。 */
 function parseRepos(raw: string): string[] {
-  const repos = raw
-    .split(/[\s,]+/)
-    .map((s) => s.replace(/^https?:\/\/github\.com\//, "").replace(/(\.git)?\/?$/, ""))
-    .filter((s) => /^[\w.-]+\/[\w.-]+$/.test(s));
+  const repos = raw.split(/[\s,]+/).flatMap((s) => parseRepo(s) ?? []);
   return [...new Set(repos)];
+}
+
+/**
+ * 登録したリポジトリは LocalStorage に置く。Raycast の設定画面には複数行の入力欄が無く、
+ * Cache は容量を超えると消えることがあるため。
+ */
+const REPOS_KEY = "repos";
+
+/** 読み込み中は undefined。前のバージョンで設定画面に入れていた値は、初めて読むときに引き継ぐ。 */
+function useRepos(): [string[] | undefined, (next: string[]) => Promise<void>] {
+  // LocalStorage は読むのを待つ必要があるので、同じ値の写しを Cache に置いて最初の表示に使う。
+  // 一覧が空のまま画面を出すと、右上の選択が覚えていた値に合わず、先頭に戻されて記憶が消えるため
+  const [repos, setRepos] = useState<string[] | undefined>(() => readCache<string[]>(REPOS_KEY));
+  const apply = (next: string[]) => {
+    cache.set(REPOS_KEY, JSON.stringify(next));
+    setRepos(next);
+  };
+  useEffect(() => {
+    LocalStorage.getItem<string>(REPOS_KEY).then((raw) => {
+      if (raw !== undefined) return apply(JSON.parse(raw) as string[]);
+      const legacy = parseRepos(getPreferenceValues<Prefs>().repos ?? "");
+      apply(legacy);
+      if (legacy.length > 0) LocalStorage.setItem(REPOS_KEY, JSON.stringify(legacy));
+    });
+  }, []);
+  const save = async (next: string[]) => {
+    await LocalStorage.setItem(REPOS_KEY, JSON.stringify(next));
+    apply(next);
+  };
+  return [repos, save];
+}
+
+function EditRepos(props: { repos: string[]; onSave: (next: string[]) => Promise<void> }) {
+  const { pop } = useNavigation();
+  const [error, setError] = useState<string>();
+
+  const submit = async ({ repos }: { repos: string }) => {
+    const lines = repos
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const invalid = lines.filter((line) => !parseRepo(line));
+    if (invalid.length > 0) {
+      setError(`この形では読めません：${invalid.join("、")}`);
+      return;
+    }
+    await props.onSave([...new Set(lines.map((line) => parseRepo(line) as string))]);
+    pop();
+  };
+
+  return (
+    <Form
+      navigationTitle="リポジトリを編集する"
+      actions={
+        <ActionPanel>
+          <Action.SubmitForm title="保存する" icon={Icon.Check} onSubmit={submit} />
+        </ActionPanel>
+      }
+    >
+      <Form.TextArea
+        id="repos"
+        title="リポジトリ"
+        placeholder={"owner/repo\nowner/another-repo"}
+        defaultValue={props.repos.join("\n")}
+        error={error}
+        onChange={() => setError(undefined)}
+      />
+      <Form.Description
+        text={
+          "1 行に 1 つ、持ち主とリポジトリの名前を / でつないで書きます（例：octocat/Hello-World）。\n" +
+          "GitHub のリポジトリの URL をそのまま貼っても構いません。\n" +
+          "書いた順に、検索画面の右上のプルダウンに並びます。"
+        }
+      />
+    </Form>
+  );
 }
 
 function resolveGh(ghPath?: string): string {
@@ -178,15 +291,67 @@ async function searchIssues(
   return { issues, total };
 }
 
-/** 各リポジトリから、その番号の issue を取る。PR の番号や存在しない番号は結果に出さない。 */
-async function fetchByNumber(repos: string[], number: number, signal: AbortSignal): Promise<Issue[]> {
-  const fields = repos.map((repo, i) => {
-    const [owner, name] = repo.split("/");
-    return `r${i}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { issue(number: ${number}) { ${ISSUE_FIELDS} } }`;
-  });
-  type Result = Record<string, { issue: Issue | null } | null>;
-  const { data } = await ghGraphql<Result>(`{ ${fields.join("\n")} }`, {}, signal);
-  return Object.values(data).flatMap((r) => (r?.issue ? [r.issue] : []));
+const PROJECT_ITEMS_QUERY = `query($id: ID!, $q: String!, $after: String) {
+  node(id: $id) { ... on ProjectV2 {
+    items(first: 100, after: $after, query: $q) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes { content { ... on Issue { ${ISSUE_FIELDS} } } }
+    }
+  } }
+}`;
+
+/**
+ * プロジェクトの絞り込みに当てはまる issue を全件取る。issue の検索には Iteration の条件が無いため。
+ * 1 つのイテレーションはふつう数十件なので上限は気にしないが、未設定で絞ると多くなりうるので歯止めだけ置く。
+ */
+const PROJECT_MAX_PAGES = 10;
+
+async function searchProjectItems(
+  projectId: string,
+  q: string,
+  signal: AbortSignal,
+  onPage?: (found: Found) => void,
+): Promise<Found> {
+  type Result = {
+    node: {
+      items?: {
+        totalCount: number;
+        pageInfo: { hasNextPage: boolean; endCursor: string | null };
+        nodes: { content: Partial<Issue> | null }[];
+      };
+    } | null;
+  };
+  const issues: Issue[] = [];
+  let total = 0;
+  let after: string | undefined;
+  // 一覧はほかの絞り込みと同じく、最近更新された順に並べる
+  const sorted = () => [...issues].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  for (let page = 0; page < PROJECT_MAX_PAGES; page++) {
+    const { data, warning } = await ghGraphql<Result>(PROJECT_ITEMS_QUERY, { id: projectId, q, after }, signal);
+    const items = data.node?.items;
+    if (!items) throw new Error(warning || "プロジェクトが見つかりません");
+    total = items.totalCount;
+    issues.push(...onlyIssues(items.nodes.flatMap((node) => (node.content ? [node.content] : []))));
+    onPage?.({ issues: sorted(), total });
+    if (!items.pageInfo.hasNextPage || !items.pageInfo.endCursor) break;
+    after = items.pageInfo.endCursor;
+  }
+  return { issues: sorted(), total };
+}
+
+/** その番号の issue を取る。PR の番号や存在しない番号は結果に出さない。 */
+async function fetchByNumber(repo: string, number: number, signal: AbortSignal): Promise<Issue[]> {
+  const [owner, name] = repo.split("/");
+  type Result = { repository: { issue: Issue | null } | null };
+  const { data } = await ghGraphql<Result>(
+    `query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) { issue(number: $number) { ${ISSUE_FIELDS} } }
+    }`,
+    { owner, name, number },
+    signal,
+  );
+  return data.repository?.issue ? [data.repository.issue] : [];
 }
 
 function readCache<T>(key: string): T | undefined {
@@ -236,7 +401,11 @@ function useFetch<T>(
         .catch((error: Error) => {
           if (controller.signal.aborted) return;
           setState((prev) => ({ data: prev.data, isLoading: false }));
-          showToast({ style: Toast.Style.Failure, title: "検索に失敗しました", message: error.message });
+          showToast({
+            style: Toast.Style.Failure,
+            title: "検索に失敗しました",
+            message: error.message,
+          });
         });
     }, delay);
     return () => {
@@ -248,22 +417,60 @@ function useFetch<T>(
   return state;
 }
 
-/** 設定したリポジトリで使える Issue Type の名前。見つからないリポジトリがあれば知らせる。 */
-function useIssueTypes(repos: string[]): string[] {
-  const [types, setTypes] = useStored<string[]>("issueTypes", []);
+type RepoMeta = { issueTypes: string[]; projects: ProjectInfo[] };
+
+const REPO_META_FIELDS = `issueTypes(first: 50) { nodes { name } }
+  projectsV2(first: 20, query: "is:open") { nodes {
+    id title url
+    fields(first: 50) { nodes { ... on ProjectV2IterationField { name configuration {
+      iterations { title startDate duration }
+      completedIterations { title startDate duration }
+    } } } }
+  } }`;
+
+/**
+ * 設定したリポジトリごとの、使える Issue Type と、紐づいているプロジェクト。
+ * 前回の値を先に使い、起動のたびに 1 度だけ取り直す。見つからないリポジトリがあれば知らせる。
+ */
+function useRepoMeta(repos: string[]): Record<string, RepoMeta> {
+  const [meta, setMeta] = useStored<Record<string, RepoMeta>>("repoMeta", {});
   const key = repos.join(",");
 
   useEffect(() => {
     if (repos.length === 0) return;
     const fields = repos.map((repo, i) => {
       const [owner, name] = repo.split("/");
-      return `r${i}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { issueTypes(first: 50) { nodes { name } } }`;
+      return `r${i}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { ${REPO_META_FIELDS} }`;
     });
-    type Result = Record<string, { issueTypes: { nodes: { name: string }[] } | null } | null>;
+    type Field = { name?: string; configuration?: { iterations: Iteration[]; completedIterations: Iteration[] } };
+    type Result = Record<
+      string,
+      {
+        issueTypes: { nodes: { name: string }[] } | null;
+        projectsV2: { nodes: { id: string; title: string; url: string; fields: { nodes: (Field | null)[] } }[] };
+      } | null
+    >;
     ghGraphql<Result>(`{ ${fields.join("\n")} }`)
       .then(({ data }) => {
-        const names = Object.values(data).flatMap((r) => r?.issueTypes?.nodes.map((n) => n.name) ?? []);
-        setTypes([...new Set(names)].sort());
+        const next: Record<string, RepoMeta> = {};
+        repos.forEach((repo, i) => {
+          const r = data[`r${i}`];
+          if (!r) return;
+          next[repo] = {
+            issueTypes: (r.issueTypes?.nodes.map((n) => n.name) ?? []).sort(),
+            projects: r.projectsV2.nodes.map((p) => {
+              const field = p.fields.nodes.find((f) => f?.configuration);
+              return {
+                id: p.id,
+                title: p.title,
+                url: p.url,
+                iterationField:
+                  field?.name && field.configuration ? { name: field.name, ...field.configuration } : null,
+              };
+            }),
+          };
+        });
+        setMeta(next);
         const missing = repos.filter((_, i) => !data[`r${i}`]);
         if (missing.length > 0) {
           showToast({
@@ -274,11 +481,63 @@ function useIssueTypes(repos: string[]): string[] {
         }
       })
       .catch(() => {
-        // 検索のほうが同じ原因で失敗して知らせるので、ここでは前回の一覧を使い続ける
+        // 検索のほうが同じ原因で失敗して知らせるので、ここでは前回の値を使い続ける
       });
   }, [key]);
 
-  return types;
+  return meta;
+}
+
+function addDays(date: string, days: number): Date {
+  const d = new Date(`${date}T00:00:00`);
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+function iterationRange(it: Iteration): string {
+  const md = (d: Date) => `${d.getMonth() + 1}/${d.getDate()}`;
+  return `${md(addDays(it.startDate, 0))}〜${md(addDays(it.startDate, it.duration - 1))}`;
+}
+
+/** 選んだ指定が、今日の時点でどの Iteration にあたるか。一覧が無ければ undefined。 */
+function resolveIteration(choice: IterationChoice, info: ProjectInfo | null): Iteration | undefined {
+  const field = info?.iterationField;
+  if (!field) return undefined;
+  const now = new Date();
+  const all = [...field.completedIterations, ...field.iterations].sort((a, b) =>
+    a.startDate.localeCompare(b.startDate),
+  );
+  const currentIndex = all.findIndex(
+    (it) => addDays(it.startDate, 0) <= now && now < addDays(it.startDate, it.duration),
+  );
+  if (choice === "@current") return all[currentIndex];
+  if (choice === "@next") return all.find((it) => addDays(it.startDate, 0) > now);
+  if (choice === "@previous") {
+    const ended = all.filter((it) => addDays(it.startDate, it.duration) <= now);
+    return ended[ended.length - 1];
+  }
+  return all.find((it) => it.title === choice);
+}
+
+const RELATIVE_LABEL: Record<string, string> = {
+  "@current": "今のイテレーション",
+  "@next": "次のイテレーション",
+  "@previous": "前のイテレーション",
+};
+
+function iterationLabel(choice: IterationChoice, info: ProjectInfo | null): string {
+  if (choice === NO_ITERATION) return "イテレーション未設定";
+  const it = resolveIteration(choice, info);
+  const range = it ? `（${iterationRange(it)}）` : "";
+  return RELATIVE_LABEL[choice] ? `${RELATIVE_LABEL[choice]}${range}` : `イテレーション ${choice}${range}`;
+}
+
+/** プロジェクトの絞り込みの書き方での Iteration の条件。フィールドの名前がそのまま条件の名前になる。 */
+function iterationQualifier(choice: IterationChoice, fieldName: string): string {
+  const name = /\s/.test(fieldName) ? `"${fieldName}"` : fieldName.toLowerCase();
+  if (choice === NO_ITERATION) return `no:${name}`;
+  if (choice.startsWith("@")) return `${name}:${choice}`;
+  return `${name}:"${choice.replace(/"/g, "")}"`;
 }
 
 type ParentRecord = Omit<ParentIssue, "parent"> & { parentId: string | null };
@@ -351,19 +610,35 @@ function normalize(s: string): string {
 }
 
 export default function Command() {
-  const repos = useMemo(() => parseRepos(getPreferenceValues<Prefs>().repos), []);
+  const [loadedRepos, saveRepos] = useRepos();
+  const repos = loadedRepos ?? [];
+  const meta = useRepoMeta(repos);
   const [text, setText] = useState("");
-  const [excluded, setExcluded] = useStored<string[]>("excludedRepos", []);
-  const [issueType, setIssueType] = useStored<string>("issueType", "");
+  // 右上で選ぶ「リポジトリ」か「リポジトリとプロジェクトの組」。プロジェクトを選ぶと Iteration などはそれで動く
+  const [scope, setScope] = useStored<string>("scope", "");
+  const [scopeRepo, scopeProjectId] = scope.split(SCOPE_SEPARATOR);
+  const repo: string | undefined = repos.includes(scopeRepo) ? scopeRepo : repos[0];
+  const project = (repo && meta[repo]?.projects.find((p) => p.id === scopeProjectId)) || null;
+  // Issue Type はリポジトリごとに、Iteration はプロジェクトごとに種類が違うので、それぞれの単位で覚える
+  const [typesByRepo, setTypesByRepo] = useStored<Record<string, string[]>>("issueTypesByRepo", {});
+  const [iterationByProject, setIterationByProject] = useStored<Record<string, IterationChoice>>(
+    "iterationByProject",
+    {},
+  );
   const [state, setState] = useStored<IssueState>("state", "open");
   const [mine, setMine] = useStored<boolean>("mine", false);
   const [showDetail, setShowDetail] = useStored<boolean>("detailPanel", false);
 
-  const types = useIssueTypes(repos);
-  // 覚えていた Issue Type が一覧に無いと Dropdown が先頭に戻して記憶を消すので、必ず選択肢に含める
-  const typeOptions = issueType && !types.includes(issueType) ? [issueType, ...types] : types;
+  const issueTypes = (repo && typesByRepo[repo]) || [];
+  const setIssueTypes = (next: string[]) => repo && setTypesByRepo({ ...typesByRepo, [repo]: next });
+  const iteration = (project && iterationByProject[project.id]) || "";
+  const setIteration = (next: IterationChoice) =>
+    project && setIterationByProject({ ...iterationByProject, [project.id]: next });
 
-  const activeRepos = repos.filter((repo) => !excluded.includes(repo));
+  const types = (repo && meta[repo]?.issueTypes) || [];
+  // 覚えていた Issue Type が一覧に無いと選べなくなるので、必ず選択肢に含める
+  const typeOptions = [...issueTypes.filter((t) => !types.includes(t)), ...types];
+
   const trimmed = text.trim();
   // "#123" は番号だけで探す。打ちかけの "#" も番号の入力中として扱い、キーワード検索に回さない
   const numberMode = /^#\d*$/.test(trimmed);
@@ -371,23 +646,48 @@ export default function Command() {
   // "label:bug" のような GitHub の検索条件はタイトルの文字では判定できないので、GitHub の検索だけに任せる
   const hasQualifier = /\S:\S/.test(trimmed);
 
+  const quotedTypes = issueTypes.map((t) => `"${t.replace(/"/g, "")}"`);
   const baseQuery = useMemo(() => {
-    if (activeRepos.length === 0) return null;
-    const parts = [`(${activeRepos.map((repo) => `repo:${repo}`).join(" OR ")})`, "is:issue"];
+    if (!repo) return null;
+    const parts = [`repo:${repo}`, "is:issue"];
     if (state !== "all") parts.push(`is:${state}`);
-    if (issueType) parts.push(`type:"${issueType.replace(/"/g, "")}"`);
+    if (quotedTypes.length > 0) parts.push(`(${quotedTypes.map((t) => `type:${t}`).join(" OR ")})`);
     if (mine) parts.push("assignee:@me");
     return parts.join(" ");
-  }, [activeRepos.join(","), state, issueType, mine]);
+  }, [repo, state, quotedTypes.join(","), mine]);
+
+  // プロジェクトの絞り込みの書き方は issue の検索と違い、OR をカンマで書く
+  const projectQuery =
+    repo && project?.iterationField && iteration
+      ? [
+          "is:issue",
+          `repo:${repo}`,
+          ...(state !== "all" ? [`is:${state}`] : []),
+          ...(quotedTypes.length > 0 ? [`type:${quotedTypes.join(",")}`] : []),
+          ...(mine ? ["assignee:@me"] : []),
+          iterationQualifier(iteration, project.iterationField.name),
+        ].join(" ")
+      : null;
 
   const textQuery = baseQuery && trimmed && !numberMode ? `${baseQuery} ${trimmed}` : null;
 
   const recent = useFetch<Found>(
-    baseQuery
+    baseQuery && !projectQuery
       ? (signal, update) => searchIssues(`${baseQuery} sort:updated-desc`, RECENT_PAGES, PAGE_SIZE, signal, update)
       : null,
-    baseQuery ?? "",
+    projectQuery ? "" : (baseQuery ?? ""),
     { cacheKey: `recent:${baseQuery}` },
+  );
+  const inIteration = useFetch<Found>(
+    project && projectQuery ? (signal, update) => searchProjectItems(project.id, projectQuery, signal, update) : null,
+    projectQuery ? `${project?.id} ${projectQuery}` : "",
+    { cacheKey: `project:${project?.id} ${projectQuery}` },
+  );
+  // Iteration で絞っている間は、そのイテレーションの issue を全件取ってあるので、それを一覧の元にする
+  const listing = projectQuery ? inIteration : recent;
+  const iterationIds = useMemo(
+    () => (projectQuery ? new Set((inIteration.data?.issues ?? []).map((issue) => issue.id)) : null),
+    [projectQuery, inIteration.data],
   );
   // 本文やコメントにだけ含まれる語も探すため、GitHub の検索も関連の強い順で並べる
   const textSearch = useFetch(
@@ -396,16 +696,18 @@ export default function Command() {
     { delay: 300 },
   );
   const byNumber = useFetch(
-    issueNumber !== null && activeRepos.length > 0
-      ? (signal) => fetchByNumber(activeRepos, issueNumber, signal)
-      : null,
-    issueNumber !== null ? `${activeRepos.join(",")}#${issueNumber}` : "",
+    issueNumber !== null && repo ? (signal) => fetchByNumber(repo, issueNumber, signal) : null,
+    issueNumber !== null ? `${repo}#${issueNumber}` : "",
   );
 
   // 打つたびに 300 件のタイトルを正規化し直さないよう、取得した時点で 1 度だけ作る
   const normalizedRecent = useMemo(
-    () => (recent.data?.issues ?? []).map((issue) => ({ issue, title: normalize(issue.title) })),
-    [recent.data],
+    () =>
+      (listing.data?.issues ?? []).map((issue) => ({
+        issue,
+        title: normalize(issue.title),
+      })),
+    [listing.data],
   );
   const terms = normalize(trimmed).split(/\s+/).filter(Boolean);
   const titleMatches =
@@ -413,33 +715,50 @@ export default function Command() {
       ? []
       : normalizedRecent.filter(({ title }) => terms.every((term) => title.includes(term))).map(({ issue }) => issue);
   const titleIds = new Set(titleMatches.map((issue) => issue.id));
-  const textMatches = textQuery ? (textSearch.data?.issues ?? []).filter((issue) => !titleIds.has(issue.id)) : [];
+  // GitHub の検索は Iteration で絞れないので、そのイテレーションにある issue だけを残す
+  const textMatches = textQuery
+    ? (textSearch.data?.issues ?? []).filter(
+        (issue) => !titleIds.has(issue.id) && (!iterationIds || iterationIds.has(issue.id)),
+      )
+    : [];
   const numberMatches = issueNumber !== null ? (byNumber.data ?? []) : [];
 
   const parentMap = useAncestors([...titleMatches, ...textMatches, ...numberMatches]);
 
-  const isLoading = numberMode ? byNumber.isLoading : recent.isLoading || textSearch.isLoading;
+  const isLoading = numberMode ? byNumber.isLoading : listing.isLoading || textSearch.isLoading;
 
-  const toggleRepo = (repo: string) =>
-    setExcluded(excluded.includes(repo) ? excluded.filter((r) => r !== repo) : [...excluded, repo]);
+  const toggleType = (name: string) =>
+    setIssueTypes(issueTypes.includes(name) ? issueTypes.filter((t) => t !== name) : [...issueTypes, name]);
+
+  // 相対の指定を先に、名前で選ぶ Iteration（これからのもの・終わった直近 3 つ）を後に並べる
+  const namedIterations = project?.iterationField
+    ? [
+        ...project.iterationField.iterations,
+        ...[...project.iterationField.completedIterations]
+          .sort((a, b) => b.startDate.localeCompare(a.startDate))
+          .slice(0, 3),
+      ].map((it) => it.title)
+    : [];
+  const iterationChoices: IterationChoice[] = [
+    "",
+    ...RELATIVE_ITERATIONS,
+    NO_ITERATION,
+    ...namedIterations,
+    // 覚えていた名前が一覧から消えていても、選んでいることが見えるようにする
+    ...(iteration && !iteration.startsWith("@") && !namedIterations.includes(iteration) ? [iteration] : []),
+  ];
+
+  const editReposAction = (
+    <Action.Push
+      title="リポジトリを編集する"
+      icon={Icon.Pencil}
+      shortcut={{ modifiers: ["cmd", "shift"], key: "r" }}
+      target={<EditRepos repos={repos} onSave={saveRepos} />}
+    />
+  );
 
   const filterActions = (
     <ActionPanel.Section title="絞り込み">
-      <ActionPanel.Submenu
-        title="リポジトリを選ぶ"
-        icon={Icon.Filter}
-        shortcut={{ modifiers: ["cmd", "shift"], key: "r" }}
-      >
-        {repos.map((repo) => (
-          <Action
-            key={repo}
-            title={repo}
-            icon={excluded.includes(repo) ? Icon.Circle : Icon.CheckCircle}
-            onAction={() => toggleRepo(repo)}
-          />
-        ))}
-        <Action title="すべて選ぶ" icon={Icon.CheckList} onAction={() => setExcluded([])} />
-      </ActionPanel.Submenu>
       <ActionPanel.Submenu
         title="Open / Closed を切り替える"
         icon={Icon.Switch}
@@ -454,6 +773,51 @@ export default function Command() {
           />
         ))}
       </ActionPanel.Submenu>
+      <ActionPanel.Submenu
+        title="Issue Type を選ぶ（複数可）"
+        icon={Icon.Tag}
+        shortcut={{ modifiers: ["cmd", "shift"], key: "t" }}
+      >
+        {typeOptions.map((name) => (
+          <Action
+            key={name}
+            title={name}
+            icon={issueTypes.includes(name) ? Icon.CheckCircle : Icon.Circle}
+            onAction={() => toggleType(name)}
+          />
+        ))}
+        <Action title="すべての Issue Type" icon={Icon.CheckList} onAction={() => setIssueTypes([])} />
+      </ActionPanel.Submenu>
+      {project?.iterationField ? (
+        <ActionPanel.Submenu
+          title="Iteration で絞り込む"
+          icon={Icon.Calendar}
+          shortcut={{ modifiers: ["cmd", "shift"], key: "i" }}
+        >
+          {iterationChoices.map((choice) => (
+            <Action
+              key={choice}
+              title={choice ? iterationLabel(choice, project) : "Iteration で絞り込まない"}
+              icon={iteration === choice ? Icon.CheckCircle : Icon.Circle}
+              onAction={() => setIteration(choice)}
+            />
+          ))}
+        </ActionPanel.Submenu>
+      ) : (
+        // 右上の選択はコードから開けないので、どこで選ぶかを知らせる
+        <Action
+          title="Iteration で絞り込む"
+          icon={Icon.Calendar}
+          shortcut={{ modifiers: ["cmd", "shift"], key: "i" }}
+          onAction={() =>
+            showToast({
+              style: Toast.Style.Failure,
+              title: project ? `${project.title} には Iteration がありません` : "プロジェクトを選んでいません",
+              message: project ? undefined : "右上でリポジトリとプロジェクトの組を選んでください",
+            })
+          }
+        />
+      )}
       <Action
         title={mine ? "担当者で絞り込まない" : "自分が担当のものだけにする"}
         icon={Icon.Person}
@@ -466,19 +830,27 @@ export default function Command() {
         shortcut={{ modifiers: ["cmd", "shift"], key: "d" }}
         onAction={() => setShowDetail(!showDetail)}
       />
-      <Action title="リポジトリの設定を開く" icon={Icon.Gear} onAction={openExtensionPreferences} />
+      {editReposAction}
+      <Action title="gh コマンドの場所を設定する" icon={Icon.Gear} onAction={openExtensionPreferences} />
     </ActionPanel.Section>
   );
 
   const filterSummary = [
+    // プロジェクトを選んでいる間、右上にはプロジェクトの名前しか出ないので、リポジトリはここで示す
+    ...(project && repo ? [repo.split("/")[1]] : []),
+    ...(iteration ? [iterationLabel(iteration, project)] : []),
     STATE_LABEL[state],
+    ...(issueTypes.length > 0 ? [issueTypes.join(" + ")] : []),
     mine ? "自分が担当" : "担当者を問わない",
-    activeRepos.length === repos.length ? "すべてのリポジトリ" : activeRepos.join(", "),
   ].join(" ・ ");
 
-  const recentCount = recent.data?.issues.length ?? 0;
-  const recentTotal = recent.data?.total ?? 0;
-  const recentScope = recentTotal > recentCount ? `最近更新された ${recentCount} 件` : `${recentCount} 件`;
+  const recentCount = listing.data?.issues.length ?? 0;
+  const recentTotal = listing.data?.total ?? 0;
+  const recentScope = iteration
+    ? `${iterationLabel(iteration, project)}の ${recentCount} 件`
+    : recentTotal > recentCount
+      ? `最近更新された ${recentCount} 件`
+      : `${recentCount} 件`;
   const titleSectionTitle = trimmed
     ? `タイトルに含む：${titleMatches.length} 件（${recentScope}の中から）`
     : `${recentTotal > recentCount ? `${recentTotal} 件中 ${recentCount} 件` : `${recentCount} 件`} ・ ${filterSummary}`;
@@ -499,11 +871,8 @@ export default function Command() {
         }
         // 行の文字は折り返せず、長いタイトルは切れるので、マウスを載せると全文が出るようにする
         title={{ value: issue.title, tooltip: issue.title }}
-        // 詳細パネルを出している間はタイトルの幅が狭いので、親の道筋はパネルに任せて行からは外す
-        subtitle={{
-          value: `${repos.length > 1 ? issue.repository.nameWithOwner : ""}#${issue.number}${path && !showDetail ? `  ${path}` : ""}`,
-          tooltip: path || null,
-        }}
+        // 行に親の道筋を並べるとタイトルが切れて読めないので、行には番号だけを出し、親は詳細パネルと番号のツールチップに任せる
+        subtitle={{ value: `#${issue.number}`, tooltip: path || null }}
         accessories={[
           ...(issue.issueType ? [{ tag: issue.issueType.name }] : []),
           ...issue.assignees.nodes.map((user) => ({
@@ -561,7 +930,10 @@ export default function Command() {
                     key={p.url}
                     title={`${labelOf(p, i)}を開く：${p.title}`}
                     url={p.url}
-                    shortcut={{ modifiers: ["cmd", "shift"], key: String(i + 1) as Keyboard.KeyEquivalent }}
+                    shortcut={{
+                      modifiers: ["cmd", "shift"],
+                      key: String(i + 1) as Keyboard.KeyEquivalent,
+                    }}
                   />
                 ))}
               </ActionPanel.Section>
@@ -574,32 +946,41 @@ export default function Command() {
   };
 
   // 0 件のときに最初の操作を絞り込みにすると、絞り込みが外れたように見えるので、GitHub での検索を最初に置く。
-  // 開く先は issue の一覧ページにする。github.com/search は "(repo:A OR repo:B)" の書き方を受け付けず 0 件になるため
+  // 開く先は issue の一覧ページにする。検索の条件の書き方が、この拡張機能と同じ ISSUE_ADVANCED のものだから
   const emptyView = (() => {
     if (repos.length === 0) {
       return {
-        title: "リポジトリが設定されていません",
-        description: "設定に owner/repo の形で入力してください",
-        actions: <ActionPanel>{filterActions}</ActionPanel>,
-      };
-    }
-    if (activeRepos.length === 0) {
-      return {
-        title: "リポジトリが 1 つも選ばれていません",
-        description: "⌘⇧R で検索するリポジトリを選んでください",
-        actions: <ActionPanel>{filterActions}</ActionPanel>,
+        title: "リポジトリが登録されていません",
+        description: "Enter で「リポジトリを編集する」を開き、検索するリポジトリを登録してください",
+        actions: <ActionPanel>{editReposAction}</ActionPanel>,
       };
     }
     if (numberMode && issueNumber === null) {
-      return { title: "issue の番号を入力してください", description: filterSummary, actions: undefined };
+      return {
+        title: "issue の番号を入力してください",
+        description: filterSummary,
+        actions: undefined,
+      };
     }
-    const webQuery =
-      issueNumber !== null
-        ? `(${activeRepos.map((repo) => `repo:${repo}`).join(" OR ")}) is:issue ${issueNumber}`
-        : `${baseQuery} ${trimmed}`.trim();
+    if (projectQuery && project && issueNumber === null) {
+      return {
+        title: "該当する issue がありません",
+        description: filterSummary,
+        actions: (
+          <ActionPanel>
+            <Action.OpenInBrowser
+              title="プロジェクトで同じ条件を開く"
+              url={`${project.url}?filterQuery=${encodeURIComponent(`${projectQuery} ${trimmed}`.trim())}`}
+            />
+            {filterActions}
+          </ActionPanel>
+        ),
+      };
+    }
+    const webQuery = issueNumber !== null ? `repo:${repo} is:issue ${issueNumber}` : `${baseQuery} ${trimmed}`.trim();
     return {
       title: issueNumber !== null ? `#${issueNumber} の issue は見つかりませんでした` : "該当する issue がありません",
-      description: issueNumber !== null ? activeRepos.join(", ") : filterSummary,
+      description: issueNumber !== null ? repo : filterSummary,
       actions: (
         <ActionPanel>
           <Action.OpenInBrowser
@@ -612,9 +993,19 @@ export default function Command() {
     };
   })();
 
+  // 同じ名前のリポジトリが別の持ち主にもあるときだけ、持ち主まで書く
+  const shortName = (r: string) => {
+    const name = r.split("/")[1];
+    return repos.filter((other) => other.split("/")[1] === name).length > 1 ? r : name;
+  };
+  // 覚えていたプロジェクトがまだ一覧に無い（取り直す前）ときも、その値を選んだままにする。
+  // 選択肢に無い値を渡すと、Dropdown が先頭に戻して記憶を消すため
+  const pendingProject = repo === scopeRepo && scopeProjectId && !project ? scope : null;
+  const scopeValue = pendingProject ?? (repo ? (project ? `${repo}${SCOPE_SEPARATOR}${project.id}` : repo) : "");
+
   return (
     <List
-      isLoading={isLoading}
+      isLoading={isLoading || loadedRepos === undefined}
       isShowingDetail={showDetail}
       searchText={text}
       // 数字だけを打ったら番号で探したいときなので、"#" を補って番号の検索にする
@@ -624,18 +1015,36 @@ export default function Command() {
       }
       searchBarPlaceholder="タイトルの一部・本文の語・#番号（label:bug のような条件も書けます）"
       searchBarAccessory={
-        <List.Dropdown tooltip="Issue Type" value={issueType} onChange={setIssueType}>
-          <List.Dropdown.Item title="すべての Issue Type" value="" />
-          {typeOptions.map((name) => (
-            <List.Dropdown.Item key={name} title={name} value={name} />
-          ))}
-        </List.Dropdown>
+        loadedRepos === undefined ? undefined : (
+          <List.Dropdown tooltip="リポジトリとプロジェクト" value={scopeValue} onChange={setScope}>
+            {repos.map((r) => (
+              // 選んだ項目の名前の長さで幅が決まり、幅は指定できないので、名前は短くし、どのリポジトリかは区切りの見出しで示す
+              <List.Dropdown.Section key={r} title={r}>
+                <List.Dropdown.Item title={shortName(r)} value={r} icon={Icon.Folder} keywords={[r]} />
+                {(meta[r]?.projects ?? []).map((p) => (
+                  <List.Dropdown.Item
+                    key={p.id}
+                    title={p.title}
+                    value={`${r}${SCOPE_SEPARATOR}${p.id}`}
+                    icon={Icon.Calendar}
+                    keywords={[r]}
+                  />
+                ))}
+                {pendingProject && r === repo && (
+                  <List.Dropdown.Item title="プロジェクトを読み込み中" value={pendingProject} icon={Icon.Calendar} />
+                )}
+              </List.Dropdown.Section>
+            ))}
+          </List.Dropdown>
+        )
       }
       actions={<ActionPanel>{filterActions}</ActionPanel>}
     >
-      {!isLoading && <List.EmptyView icon={Icon.MagnifyingGlass} {...emptyView} />}
+      {!isLoading && loadedRepos !== undefined && <List.EmptyView icon={Icon.MagnifyingGlass} {...emptyView} />}
       {numberMode ? (
-        <List.Section title={`#${issueNumber ?? ""}（Open / Closed・Issue Type・担当者の絞り込みは使いません）`}>
+        <List.Section
+          title={`#${issueNumber ?? ""}（Open / Closed・Issue Type・Iteration・担当者の絞り込みは使いません）`}
+        >
           {numberMatches.map(renderItem)}
         </List.Section>
       ) : (

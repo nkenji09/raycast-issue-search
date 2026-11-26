@@ -20,11 +20,10 @@
   "preferences": [
     {
       "name": "repos",
-      "title": "リポジトリ",
-      "description": "検索するリポジトリを owner/repo の形で、カンマか空白で区切って並べる。",
+      "title": "リポジトリ（引き継ぎ用）",
+      "description": "前のバージョンで使っていた欄。最初に開いたときだけ読み、検索画面の「リポジトリを編集する」に引き継ぐ。いまの登録は検索画面の ⌘⇧R で変える。",
       "type": "textfield",
-      "required": true,
-      "placeholder": "owner/repo, owner/another-repo"
+      "required": false
     },
     {
       "name": "ghPath",
