@@ -41,6 +41,8 @@ type ProjectInfo = {
     iterations: Iteration[];
     completedIterations: Iteration[];
   } | null;
+  /** Status のフィールドが無いプロジェクトでは null。前のバージョンの記憶には無いので undefined もありうる */
+  statusField?: { name: string; options: string[] } | null;
 };
 
 type ParentIssue = {
@@ -422,10 +424,13 @@ type RepoMeta = { issueTypes: string[]; projects: ProjectInfo[] };
 const REPO_META_FIELDS = `issueTypes(first: 50) { nodes { name } }
   projectsV2(first: 20, query: "is:open") { nodes {
     id title url
-    fields(first: 50) { nodes { ... on ProjectV2IterationField { name configuration {
-      iterations { title startDate duration }
-      completedIterations { title startDate duration }
-    } } } }
+    fields(first: 50) { nodes {
+      ... on ProjectV2IterationField { name configuration {
+        iterations { title startDate duration }
+        completedIterations { title startDate duration }
+      } }
+      ... on ProjectV2SingleSelectField { name options { name } }
+    } }
   } }`;
 
 /**
@@ -442,7 +447,11 @@ function useRepoMeta(repos: string[]): Record<string, RepoMeta> {
       const [owner, name] = repo.split("/");
       return `r${i}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { ${REPO_META_FIELDS} }`;
     });
-    type Field = { name?: string; configuration?: { iterations: Iteration[]; completedIterations: Iteration[] } };
+    type Field = {
+      name?: string;
+      configuration?: { iterations: Iteration[]; completedIterations: Iteration[] };
+      options?: { name: string }[];
+    };
     type Result = Record<
       string,
       {
@@ -460,12 +469,18 @@ function useRepoMeta(repos: string[]): Record<string, RepoMeta> {
             issueTypes: (r.issueTypes?.nodes.map((n) => n.name) ?? []).sort(),
             projects: r.projectsV2.nodes.map((p) => {
               const field = p.fields.nodes.find((f) => f?.configuration);
+              // Status はプロジェクトを作ると最初からある単一選択のフィールドで、名前で見分ける
+              const status = p.fields.nodes.find((f) => f?.options && f.name?.toLowerCase() === "status");
               return {
                 id: p.id,
                 title: p.title,
                 url: p.url,
                 iterationField:
                   field?.name && field.configuration ? { name: field.name, ...field.configuration } : null,
+                statusField:
+                  status?.name && status.options
+                    ? { name: status.name, options: status.options.map((o) => o.name) }
+                    : null,
               };
             }),
           };
@@ -532,9 +547,14 @@ function iterationLabel(choice: IterationChoice, info: ProjectInfo | null): stri
   return RELATIVE_LABEL[choice] ? `${RELATIVE_LABEL[choice]}${range}` : `イテレーション ${choice}${range}`;
 }
 
-/** プロジェクトの絞り込みの書き方での Iteration の条件。フィールドの名前がそのまま条件の名前になる。 */
+/** プロジェクトの絞り込みでは、フィールドの名前がそのまま条件の名前になる。空白を含む名前は引用符で囲む。 */
+function fieldQualifierName(fieldName: string): string {
+  return /\s/.test(fieldName) ? `"${fieldName}"` : fieldName.toLowerCase();
+}
+
+/** プロジェクトの絞り込みの書き方での Iteration の条件。 */
 function iterationQualifier(choice: IterationChoice, fieldName: string): string {
-  const name = /\s/.test(fieldName) ? `"${fieldName}"` : fieldName.toLowerCase();
+  const name = fieldQualifierName(fieldName);
   if (choice === NO_ITERATION) return `no:${name}`;
   if (choice.startsWith("@")) return `${name}:${choice}`;
   return `${name}:"${choice.replace(/"/g, "")}"`;
@@ -609,6 +629,60 @@ function normalize(s: string): string {
   return s.normalize("NFKC").toLowerCase();
 }
 
+/**
+ * 複数を選ぶための一覧の画面。操作のメニュー（ActionPanel）は 1 つ選ぶと必ず閉じるので、
+ * Enter で付け外ししても閉じない一覧の画面に分ける。検索画面へは Esc で戻る。
+ * 開いた後は呼び出し元の再描画が届かないので、選択はこの画面の中で持ち、変えるたびに onChange で知らせる。
+ */
+function MultiSelectList(props: {
+  name: string;
+  options: string[];
+  selected: string[];
+  onChange: (next: string[]) => void;
+}) {
+  const [selected, setSelected] = useState(props.selected);
+  const update = (next: string[]) => {
+    setSelected(next);
+    props.onChange(next);
+  };
+  const summary = selected.length > 0 ? selected.join(" + ") : `すべての ${props.name}`;
+
+  return (
+    <List
+      navigationTitle={`${props.name} を選ぶ`}
+      searchBarPlaceholder={`${props.name} の名前で絞り込む（Enter で付け外し、Esc で戻る）`}
+    >
+      <List.Section title={`選択中：${summary}`}>
+        {props.options.map((option) => {
+          const on = selected.includes(option);
+          return (
+            <List.Item
+              key={option}
+              title={option}
+              icon={on ? { source: Icon.CheckCircle, tintColor: Color.Green } : Icon.Circle}
+              actions={
+                <ActionPanel>
+                  <Action
+                    title={on ? "外す" : "選ぶ"}
+                    icon={on ? Icon.Circle : Icon.CheckCircle}
+                    onAction={() => update(on ? selected.filter((s) => s !== option) : [...selected, option])}
+                  />
+                  <Action
+                    title={`すべての ${props.name}（選択を外す）`}
+                    icon={Icon.CheckList}
+                    shortcut={{ modifiers: ["cmd", "shift"], key: "backspace" }}
+                    onAction={() => update([])}
+                  />
+                </ActionPanel>
+              }
+            />
+          );
+        })}
+      </List.Section>
+    </List>
+  );
+}
+
 export default function Command() {
   const [loadedRepos, saveRepos] = useRepos();
   const repos = loadedRepos ?? [];
@@ -625,6 +699,7 @@ export default function Command() {
     "iterationByProject",
     {},
   );
+  const [statusByProject, setStatusByProject] = useStored<Record<string, string[]>>("statusByProject", {});
   const [state, setState] = useStored<IssueState>("state", "open");
   const [mine, setMine] = useStored<boolean>("mine", false);
   const [showDetail, setShowDetail] = useStored<boolean>("detailPanel", false);
@@ -634,6 +709,13 @@ export default function Command() {
   const iteration = (project && iterationByProject[project.id]) || "";
   const setIteration = (next: IterationChoice) =>
     project && setIterationByProject({ ...iterationByProject, [project.id]: next });
+
+  const statuses = (project && statusByProject[project.id]) || [];
+  const setStatuses = (next: string[]) => project && setStatusByProject({ ...statusByProject, [project.id]: next });
+  const statusOptions = [
+    ...statuses.filter((s) => !project?.statusField?.options.includes(s)),
+    ...(project?.statusField?.options ?? []),
+  ];
 
   const types = (repo && meta[repo]?.issueTypes) || [];
   // 覚えていた Issue Type が一覧に無いと選べなくなるので、必ず選択肢に含める
@@ -657,15 +739,25 @@ export default function Command() {
   }, [repo, state, quotedTypes.join(","), mine]);
 
   // プロジェクトの絞り込みの書き方は issue の検索と違い、OR をカンマで書く
+  // Iteration も Status も issue の検索では絞れないので、どちらかを選んだらプロジェクトの項目から取る
+  const activeIteration = project?.iterationField && iteration ? iteration : "";
+  const activeStatuses = project?.statusField ? statuses : [];
   const projectQuery =
-    repo && project?.iterationField && iteration
+    repo && project && (activeIteration || activeStatuses.length > 0)
       ? [
           "is:issue",
           `repo:${repo}`,
           ...(state !== "all" ? [`is:${state}`] : []),
           ...(quotedTypes.length > 0 ? [`type:${quotedTypes.join(",")}`] : []),
           ...(mine ? ["assignee:@me"] : []),
-          iterationQualifier(iteration, project.iterationField.name),
+          ...(activeIteration && project.iterationField
+            ? [iterationQualifier(activeIteration, project.iterationField.name)]
+            : []),
+          ...(activeStatuses.length > 0 && project.statusField
+            ? [
+                `${fieldQualifierName(project.statusField.name)}:${activeStatuses.map((s) => `"${s.replace(/"/g, "")}"`).join(",")}`,
+              ]
+            : []),
         ].join(" ")
       : null;
 
@@ -727,9 +819,6 @@ export default function Command() {
 
   const isLoading = numberMode ? byNumber.isLoading : listing.isLoading || textSearch.isLoading;
 
-  const toggleType = (name: string) =>
-    setIssueTypes(issueTypes.includes(name) ? issueTypes.filter((t) => t !== name) : [...issueTypes, name]);
-
   // 相対の指定を先に、名前で選ぶ Iteration（これからのもの・終わった直近 3 つ）を後に並べる
   const namedIterations = project?.iterationField
     ? [
@@ -757,6 +846,14 @@ export default function Command() {
     />
   );
 
+  // 右上の選択はコードから開けないので、どこで選ぶかを知らせる
+  const showMissingProjectField = (field: string) =>
+    showToast({
+      style: Toast.Style.Failure,
+      title: project ? `${project.title} には ${field} がありません` : "プロジェクトを選んでいません",
+      message: project ? undefined : "右上でリポジトリとプロジェクトの組を選んでください",
+    });
+
   const filterActions = (
     <ActionPanel.Section title="絞り込み">
       <ActionPanel.Submenu
@@ -773,21 +870,14 @@ export default function Command() {
           />
         ))}
       </ActionPanel.Submenu>
-      <ActionPanel.Submenu
+      <Action.Push
         title="Issue Type を選ぶ（複数可）"
         icon={Icon.Tag}
         shortcut={{ modifiers: ["cmd", "shift"], key: "t" }}
-      >
-        {typeOptions.map((name) => (
-          <Action
-            key={name}
-            title={name}
-            icon={issueTypes.includes(name) ? Icon.CheckCircle : Icon.Circle}
-            onAction={() => toggleType(name)}
-          />
-        ))}
-        <Action title="すべての Issue Type" icon={Icon.CheckList} onAction={() => setIssueTypes([])} />
-      </ActionPanel.Submenu>
+        target={
+          <MultiSelectList name="Issue Type" options={typeOptions} selected={issueTypes} onChange={setIssueTypes} />
+        }
+      />
       {project?.iterationField ? (
         <ActionPanel.Submenu
           title="Iteration で絞り込む"
@@ -804,18 +894,26 @@ export default function Command() {
           ))}
         </ActionPanel.Submenu>
       ) : (
-        // 右上の選択はコードから開けないので、どこで選ぶかを知らせる
         <Action
           title="Iteration で絞り込む"
           icon={Icon.Calendar}
           shortcut={{ modifiers: ["cmd", "shift"], key: "i" }}
-          onAction={() =>
-            showToast({
-              style: Toast.Style.Failure,
-              title: project ? `${project.title} には Iteration がありません` : "プロジェクトを選んでいません",
-              message: project ? undefined : "右上でリポジトリとプロジェクトの組を選んでください",
-            })
-          }
+          onAction={() => showMissingProjectField("Iteration")}
+        />
+      )}
+      {project?.statusField ? (
+        <Action.Push
+          title="Status で絞り込む（複数可）"
+          icon={Icon.CircleProgress}
+          shortcut={{ modifiers: ["cmd", "shift"], key: "p" }}
+          target={<MultiSelectList name="Status" options={statusOptions} selected={statuses} onChange={setStatuses} />}
+        />
+      ) : (
+        <Action
+          title="Status で絞り込む"
+          icon={Icon.CircleProgress}
+          shortcut={{ modifiers: ["cmd", "shift"], key: "p" }}
+          onAction={() => showMissingProjectField("Status")}
         />
       )}
       <Action
@@ -838,7 +936,8 @@ export default function Command() {
   const filterSummary = [
     // プロジェクトを選んでいる間、右上にはプロジェクトの名前しか出ないので、リポジトリはここで示す
     ...(project && repo ? [repo.split("/")[1]] : []),
-    ...(iteration ? [iterationLabel(iteration, project)] : []),
+    ...(activeIteration ? [iterationLabel(activeIteration, project)] : []),
+    ...(activeStatuses.length > 0 ? [activeStatuses.join(" + ")] : []),
     STATE_LABEL[state],
     ...(issueTypes.length > 0 ? [issueTypes.join(" + ")] : []),
     mine ? "自分が担当" : "担当者を問わない",
@@ -846,8 +945,8 @@ export default function Command() {
 
   const recentCount = listing.data?.issues.length ?? 0;
   const recentTotal = listing.data?.total ?? 0;
-  const recentScope = iteration
-    ? `${iterationLabel(iteration, project)}の ${recentCount} 件`
+  const recentScope = projectQuery
+    ? `${project?.title} で絞った ${recentCount} 件`
     : recentTotal > recentCount
       ? `最近更新された ${recentCount} 件`
       : `${recentCount} 件`;
